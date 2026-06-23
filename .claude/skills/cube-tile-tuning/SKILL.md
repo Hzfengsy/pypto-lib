@@ -55,10 +55,10 @@ python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --
    weight = 1), and how many accumulators are live. M is usually the row/occupancy
    tile; N and K come from the weight.
 
-2. **Analytic pass — `hint_l1_tile.py`.** Run per matmul, both `--wave` (default) and
-   `--no-wave-considered`. Read it for *direction* (does it want bigger N? pin A or
-   B?), not as a target. It ignores your bound pipe and the exact L1 model, so it
-   over-pushes TN and can suggest a sub-cache-line TK.
+2. **Analytic pass — `hint_l1_tile.py`.** Run per matmul in the default wave-considered
+   mode and again with `--no-wave-considered`. Read it for *direction* (does it want
+   bigger N? pin A or B?), not as a target. It ignores your bound pipe and the exact L1
+   model, so it over-pushes TN and can suggest a sub-cache-line TK.
 
 3. **Read the memory report.** After any build, open
    `build_output/<case>/report/memory_after_AllocateMemoryAddr.txt`. Per function it

@@ -62,6 +62,16 @@ def main():
     p.add_argument("--acc-bytes", type=int, default=None, help="override L0C/Acc budget")
     a = p.parse_args()
 
+    # Guard against zero/negative args -- K and the budgets are divisors below.
+    for name, val in (("M", a.M), ("N", a.N), ("K", a.K), ("bytes-in", a.bytes_in),
+                      ("bytes-out", a.bytes_out), ("weights", a.weights),
+                      ("double-buffer", a.double_buffer)):
+        if val <= 0:
+            p.error(f"--{name} must be > 0 (got {val})")
+    for name, val in (("accum", a.accum), ("mat-bytes", a.mat_bytes), ("acc-bytes", a.acc_bytes)):
+        if val is not None and val <= 0:
+            p.error(f"--{name} must be > 0 (got {val})")
+
     n_accum = a.accum if a.accum is not None else a.weights
     bud = dict(PLATFORM[a.platform])
     if a.mat_bytes:
