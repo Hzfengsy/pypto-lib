@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """On-chip buffer budget check for one PyPTO cube (matmul) tile.
 
 Standalone utility — no PyPTO dependency. Complements hint_l1_tile.py: that tool
@@ -87,16 +94,19 @@ def main():
     # Headroom / suggestions.
     print("  ---")
     if acc > bud["acc"]:
-        print(f"  Acc is the wall: drop N or M, or split accumulators.")
+        print("  Acc is the wall: drop N or M, or split accumulators.")
     if mat > bud["mat"]:
-        # Largest N that fits Mat at this K, and largest K at this N.
-        n_max = (bud["mat"] / a.double_buffer / a.bytes_in - a.M * a.K) / (a.weights * a.K)
-        k_max = bud["mat"] / a.double_buffer / a.bytes_in / (a.N * a.weights + a.M)
-        n_fit = int(n_max // 16 * 16)
-        k_fit = int(k_max // a.cache_line * a.cache_line)  # keep K on a cache-line multiple
-        print(f"  Mat is the wall: at K={a.K}, N<={n_fit} fits; at N={a.N}, K<={k_fit} fits.")
-        print(f"  -> trade K down to {k_fit} (>= cache-line {a.cache_line}) to keep N={a.N}, "
-              f"or shrink N to {n_fit}.")
+        if act_l1 >= bud["mat"]:
+            print("  Mat is the wall: activation alone exceeds the L1 budget -- reduce M or K.")
+        else:
+            # Largest N that fits Mat at this K, and largest K at this N.
+            n_max = (bud["mat"] / a.double_buffer / a.bytes_in - a.M * a.K) / (a.weights * a.K)
+            k_max = bud["mat"] / a.double_buffer / a.bytes_in / (a.N * a.weights + a.M)
+            n_fit = max(0, int(n_max // 16 * 16))
+            k_fit = max(0, int(k_max // a.cache_line * a.cache_line))  # keep K on a cache-line multiple
+            print(f"  Mat is the wall: at K={a.K}, N<={n_fit} fits; at N={a.N}, K<={k_fit} fits.")
+            print(f"  -> trade K down to {k_fit} (>= cache-line {a.cache_line}) to keep N={a.N}, "
+                  f"or shrink N to {n_fit}.")
     if acc <= bud["acc"] and mat <= bud["mat"] and contig >= a.cache_line:
         n_room = int((bud["mat"] / a.double_buffer / a.bytes_in - a.M * a.K) / (a.weights * a.K) // 16 * 16)
         acc_n = int(bud["acc"] / (a.M * a.bytes_out * n_accum) // 16 * 16)
