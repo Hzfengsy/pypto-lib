@@ -32,16 +32,34 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
-RECV_TILE = 48     # must divide RECV_MAX (per-expert row buffer) to avoid over-read
-K_TILE = 1024
-INTER_K = 1024
-INTER_TILE = 32
-D_OUT_TILE = 64
-QUANT_TILE = 128
-GATE_INNER = 8
-W2_INNER = 16
+# Sized for the large-batch / decode-batch target of ~24 rows/expert. RECV_TILE=32
+# runs one row-tile per expert at that occupancy (no weight re-stream); the <=8-row
+# pure-decode path can drop it to 16 (which re-streams the weight above 16 rows).
+# RECV_TILE must divide RECV_MAX (per-expert row buffer) to avoid over-read.
+RECV_TILE = 32
+# K_TILE=512 (not 1024): each split gate/up cube task holds ONE weight L1 tile of
+# MM_INTER_TILE*K_TILE, double-buffered, so Mat ~= MM_INTER_TILE*K_TILE*1*2(buf). At
+# K_TILE=512 that lets MM_INTER_TILE reach 256 (256*512*2 = 256KB, fits the 512KB Mat);
+# K_TILE=1024 would need 512KB and cap N at 128. Both N and K stay >= the 512B
+# B-cache-line (B is K-contiguous under b_trans) so MTE2 stays efficient.
+K_TILE = 512
+INTER_K = 512
+# gate/up N-tiling is split across the decoupled cube (AIC) and vector (AIV) scopes,
+# meeting only through the gate_i32/up_i32 GM buffer, so each sizes its N-frag to its
+# own bottleneck -- the cube frag to L1/Mat (see K_TILE above), the vector frag to UB.
+MM_INTER_TILE = 256   # cube N frag; L1/Mat bound: MM_INTER_TILE*K_TILE*1(split weight)*2(buf) <= 512KB
+MM_GATE_INNER = 4
+ACT_INTER_TILE = 128   # vector N frag; UB bound, independent of the cube frag
+ACT_GATE_INNER = 4
+D_OUT_TILE = 256   # w2 N frag; UB bound. The decoupled vector scope frees the room the
+                   # fused form lacked; 512 overflows AllocateMemoryAddr.
+QUANT_TILE = 256
+D_OUT_TILE_ACT = 512
+W2_INNER = 4       # keeps w2 spmd N-block count D//(W2_INNER*D_OUT_TILE)=4 with D_OUT_TILE=256
+W2_ACT_INNER = 8
 
-assert MOE_INTER % (GATE_INNER * INTER_TILE) == 0, "gate/up tiling must cover MOE_INTER"
+assert MOE_INTER % (MM_GATE_INNER * MM_INTER_TILE) == 0, "gate/up cube tiling must cover MOE_INTER"
+assert MOE_INTER % (ACT_GATE_INNER * ACT_INTER_TILE) == 0, "gate/up vector tiling must cover MOE_INTER"
 assert D % (W2_INNER * D_OUT_TILE) == 0, "w2 tiling must cover D"
 
 
@@ -73,37 +91,61 @@ def expert_routed(
 
             valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-            # Stage 1a: gate/up matmul + dequant + SwiGLU + routing-weight mul.
+            # Stage 1a: gate/up. Decoupled from the vector epilogue (cf. the un-mixed
+            # qproj in qkv_proj_rope.py): a pure-cube matmul scope writes INT32
+            # accumulators to GM, then a separate vector scope does dequant + SwiGLU +
+            # routing-weight mul. The cube is split again into a gate (w1) task and an
+            # up (w3) task so each holds only ONE weight L1 tile -- that halves Mat
+            # (MM_INTER_TILE*K_TILE*1*2buf), letting MM_INTER_TILE reach 256 at the
+            # cache-line-safe K_TILE=512; the fused form held w1+w3 and so capped N at
+            # 128. Costs one extra recv_x L1 reload per task (x is tiny vs the weights).
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+            gate_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
+            up_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
-            for nb_idx in pl.spmd(MOE_INTER // (GATE_INNER * INTER_TILE), name_hint="exp_gate_up"):
-                n_base = nb_idx * (GATE_INNER * INTER_TILE)
-                for ng in pl.range(GATE_INNER):
-                    n0 = n_base + ng * INTER_TILE
+            for nb_idx in pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+                n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
+                for ng in pl.range(MM_GATE_INNER):
+                    n0 = n_base + ng * MM_INTER_TILE
                     # Peel the first K iter (plain matmul seeds the accumulator,
                     # avoiding the if-kb==0 carry that trips the TLOAD DN->NZ ISA
                     # assertion, pypto#1540), then run the remaining K iters under
-                    # pl.pipeline so each tile's weight MTE2 load overlaps the
-                    # previous tile's cube compute. This cube is MTE2-bound (PMU:
-                    # ~80% MTE2, ~20% idle), so the overlap fills that gap; INT32
-                    # accumulation order is unchanged, so it is numerically identical.
-                    x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_TILE]
-                    w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
-                    w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
-                    gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
-                    up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                    # pl.pipeline so each tile's weight MTE2 load overlaps the previous
+                    # tile's cube compute. This cube is MTE2-bound, so the overlap fills
+                    # that gap; INT32 accumulation order is unchanged.
+                    gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                    for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                         x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
-                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
-                        w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
-                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
-                        up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
+                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                        if k0 == 0:
+                            gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
+                        else:
+                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                    gate_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
-                    gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_TILE])
-                    up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_TILE])
+            for nb_idx in pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+                n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
+                for ng in pl.range(MM_GATE_INNER):
+                    n0 = n_base + ng * MM_INTER_TILE
+                    up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
+                    for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                        w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                        if k0 == 0:
+                            up_acc = pl.matmul(x_k, w3_k, b_trans=True, out_dtype=pl.INT32)
+                        else:
+                            up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
+                    up_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+
+            for nb_idx in pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+                n_base = nb_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
+                for ng in pl.pipeline(ACT_GATE_INNER, stage=2):
+                    n0 = n_base + ng * ACT_INTER_TILE
+                    gate_2d_i32 = gate_i32[:, n0 : n0 + ACT_INTER_TILE]
+                    up_2d_i32 = up_i32[:, n0 : n0 + ACT_INTER_TILE]
                     recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
-                    w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
-                    w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
+                    w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + ACT_INTER_TILE]
+                    w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + ACT_INTER_TILE]
                     gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                     up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                     gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
@@ -115,15 +157,15 @@ def expert_routed(
                     silu = pl.mul(gate_2d, sigmoid)
                     gated = pl.mul(silu, up_2d)
                     # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
-                    gated_valid = pl.set_validshape(gated, valid_rows, INTER_TILE)
+                    gated_valid = pl.set_validshape(gated, valid_rows, ACT_INTER_TILE)
                     gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
-                    h_tile_fp32[:, n0 : n0 + INTER_TILE] = gated_masked
+                    h_tile_fp32[:, n0 : n0 + ACT_INTER_TILE] = gated_masked
 
             # Per-row A8 requant of h_tile (amax across full MOE_INTER row).
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.range(0, MOE_INTER, QUANT_TILE):
+                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
                     eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
                     eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
@@ -133,49 +175,54 @@ def expert_routed(
                 )
                 h_tile_scale_dq = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
                 eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                for k1 in pl.range(0, MOE_INTER, QUANT_TILE):
+                for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
                     eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
                     eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
-            # Stage 1b: w2 matmul + dequant + routing-weight mul + write recv_y.
-            #
-            # The routing weight is applied row-wise here (vs. the legacy
-            # single-card path that applied it in combine's reduce). Multi-card
-            # combine then just sums the TOPK rows per token, saving one
-            # cross-rank weight channel.
-            for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2"):
+            # Stage 1b: w2. Decoupled like gate/up -- pure-cube matmul scope
+            # (INT32 -> GM) then a separate vector scope (dequant + routing-weight
+            # mul + BF16 write). The routing weight is applied row-wise here (vs.
+            # the legacy single-card path that applied it in combine's reduce);
+            # multi-card combine then just sums the TOPK rows per token.
+            y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
+
+            for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
                 d_base = db_idx * (W2_INNER * D_OUT_TILE)
-                # Fold the per-row h-dequant scale and the per-row routing
-                # weight into a single per-row scale, computed once per spmd
-                # block (instead of an extra row_expand_mul per d-tile) --
-                # algebraically identical, fewer vector ops on the hot path.
+                for dg in pl.range(W2_INNER):
+                    d0 = d_base + dg * D_OUT_TILE
+                    # Peel the first K iter (pypto#1540, see exp_gate_up_mm), then
+                    # pipeline the rest so each weight MTE2 load overlaps the previous
+                    # tile's cube compute. INT32 accumulation order is unchanged.
+                    y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
+                    for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
+                        h_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                        w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                        if k0 == 0:
+                            y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
+                        else:
+                            y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+                    y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+
+            for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
+                d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+                # Fold the per-row h-dequant scale and the per-row routing weight
+                # into a single per-row scale, computed once per spmd block
+                # (instead of an extra row_expand_mul per d-tile).
                 w_col_blk = pl.reshape(
                     recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
                     [RECV_TILE, 1],
                 )
                 row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
-                for dg in pl.range(W2_INNER):
-                    d0 = d_base + dg * D_OUT_TILE
-                    # Peel-first-iter K loop (pypto#1540, see exp_gate_up). This w2
-                    # matmul is scalar/address-gen bound (PMU: scalar ~97%), not
-                    # MTE2-bound, so pipelining the K loop here buys nothing on
-                    # device and only adds simulator work -- keep it serial.
-                    h_init = h_tile_i8[:, 0 : INTER_K]
-                    w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, 0 : INTER_K]
-                    y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
-                        h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                        w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                        y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
-
-                    y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
-                    w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE]
+                for dg in pl.pipeline(W2_ACT_INNER, stage=2):
+                    d0 = d_base + dg * D_OUT_TILE_ACT
+                    y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
+                    w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE_ACT]
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                    recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE] = pl.cast(
+                    recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(
                         y_2d, target_type=pl.BF16, mode="rint"
                     )
 
