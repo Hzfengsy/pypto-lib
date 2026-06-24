@@ -56,6 +56,13 @@ NUM_LINEAR_T_TILES = T // LINEAR_T_TILE
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 assert HC_DIM % LINEAR_OK == 0 and LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
+# The 4-way reduce (pre0..pre3 / x_h0..x_h3) is hardcoded for HC_MULT == 4, and the
+# fixed-size token tiles must evenly divide T or tail rows are silently dropped.
+assert HC_MULT == 4, f"hc_head reduce is hardcoded for HC_MULT == 4, got {HC_MULT}"
+assert T % T_TILE == 0 and T % LINEAR_T_TILE == 0 and T % TRANSPOSE_T_TILE == 0, (
+    f"T ({T}) must be a multiple of T_TILE ({T_TILE}), LINEAR_T_TILE ({LINEAR_T_TILE}), "
+    f"and TRANSPOSE_T_TILE ({TRANSPOSE_T_TILE})"
+)
 
 @pl.jit.inline
 def hc_head(
@@ -99,12 +106,11 @@ def hc_head(
     # K-slice, reduces it, and atomic-adds its [T_TILE, HC_PAD] FP32 partial.
     # Token tiles touch disjoint rows, so only the LINEAR_OK tasks per row block
     # contend; the seed write -> atomic RMW WAW dependency orders seed first.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_seed"):
-        for tc in pl.range(NUM_T_TILES):
-            ts0 = tc * T_TILE
-            mixes_raw[ts0 : ts0 + T_TILE, 0:HC_PAD] = pl.full(
-                [T_TILE, HC_PAD], dtype=pl.FP32, value=0.0
-            )
+    for tc in pl.spmd(NUM_T_TILES, name_hint="hc_head_seed", allow_early_resolve=True):
+        ts0 = tc * T_TILE
+        mixes_raw[ts0 : ts0 + T_TILE, 0:HC_PAD] = pl.full(
+            [T_TILE, HC_PAD], dtype=pl.FP32, value=0.0
+        )
 
     for task in pl.spmd(NUM_LINEAR_T_TILES * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
@@ -139,7 +145,7 @@ def hc_head(
             )
             logits = pl.add(
                 pl.mul(scaled, scale),
-                pl.col_expand_mul(pl.full([TRANSPOSE_T_TILE, HC_PAD], dtype=pl.FP32, value=1.0), base),
+                pl.col_expand(scaled, base),
             )
             pre_val = pl.add(pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), HC_EPS)
             pre_t[:, t0 : t0 + TRANSPOSE_T_TILE] = pl.transpose(pre_val, axis1=0, axis2=1)
@@ -260,7 +266,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).
     # `nargs="?"` so a bare `--enable-l2-swimlane` -> mode 1 (int, not bool True).
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
