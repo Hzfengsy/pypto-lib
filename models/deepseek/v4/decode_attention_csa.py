@@ -282,6 +282,11 @@ def attention_csa(
                 c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
                 pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
 
+    # Debug: capture the fully-built sparse metadata that feeds sparse_attn.
+    # No-op unless run with enable_dump_tensor>=1 (see --dump-tensor / docs/debugging.md §5).
+    pl.dump_tag(cmp_sparse_indices)
+    pl.dump_tag(valid_block_mask)
+
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, ori_block_table, kv,
@@ -943,6 +948,10 @@ if __name__ == "__main__":
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
                              "requires an unchanged spec set.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--dump-tensor", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2),
+                        help="Dump tagged intermediate tensors (cmp_sparse_indices, valid_block_mask) "
+                             "to dfx_outputs/args_dump; inspect with simpler_setup.tools.dump_viewer. "
+                             "1=partial (tagged only), 2=full. See docs/debugging.md §5.")
     args = parser.parse_args()
 
     result = run_jit(
@@ -955,6 +964,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dump_tensor=args.dump_tensor,
         ),
         rtol=1e-2,
         atol=1e-2,
