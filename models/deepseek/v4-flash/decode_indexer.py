@@ -108,7 +108,11 @@ assert IDX_TOPK <= TOPK_HALF_LEN, "per-half candidate list must cover the final 
 
 @pl.jit.inline
 def indexer(
+    # x carries the caller's RMSNorm elementwise half only (x * gamma); the deferred
+    # per-token inv_rms rides in separately, folded into weights_proj here and into
+    # the inner compressor's projections.
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[T, 1], pl.FP32],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -254,10 +258,13 @@ def indexer(
         w_sum = weights_partial[0:MM_ROW_TILE, :]
         for kb in pl.unroll(1, WEIGHTS_OK):
             w_sum = pl.add(w_sum, weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :])
-        weights[0:MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
+        # Deferred RMSNorm denominator: weights_proj is linear in x, so inv_rms rides
+        # the split-K reduce as a row scale instead of a pass over x.
+        x_inv_rms_tile = pl.slice(x_inv_rms, [MM_ROW_TILE, 1], [0, 0], valid_shape=[pl.min(MM_ROW_TILE, T), 1])
+        weights[0:MM_ROW_TILE, :] = pl.mul(pl.row_expand_mul(w_sum, x_inv_rms_tile), WEIGHTS_SCALE)
 
     indexer_compressor(
-        x, inner_kv,
+        x, x_inv_rms, inner_kv,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cos, sin, hadamard, idx_kv_cache, idx_kv_scale,
@@ -354,6 +361,7 @@ def indexer(
 @pl.jit
 def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[T, 1], pl.FP32],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -389,6 +397,7 @@ def indexer_test(
     rope_interleave(cos, sin, cos_il, sin_signed)
     indexer(
         x,
+        x_inv_rms,
         qr,
         qr_scale,
         wq_b,
@@ -505,6 +514,7 @@ def golden_indexer(tensors):
 
     inner_tensors = {
         "x": tensors["x"],
+        "x_inv_rms": tensors["x_inv_rms"],
         "kv": tensors["inner_kv"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
@@ -523,7 +533,10 @@ def golden_indexer(tensors):
     }
     golden_compressor(inner_tensors)
 
-    weights = (x @ weights_proj) * WEIGHTS_SCALE
+    # x omitted the RMSNorm inv_rms; weights_proj is linear, so it applies here as a
+    # per-token row scale (kernel order: scale on the split-K reduce, before WEIGHTS_SCALE).
+    x_inv_rms = tensors["x_inv_rms"].float().reshape(bsz, seqlen, 1)
+    weights = ((x @ weights_proj) * x_inv_rms) * WEIGHTS_SCALE
 
     # C8 cache: pre-quantized INT8 KV + per-position dequant scale (no score-time re-quant)
     idx_kv_cache_i8 = tensors["idx_kv_cache"]
@@ -585,6 +598,10 @@ def build_tensor_specs(start_pos=None):
 
     def init_x():
         return torch.rand(B, S, D)
+    # x is the caller's (x * gamma) half, already in a normalized regime, so the
+    # deferred denominator sits near 1 -- but off it, so the row scale is exercised.
+    def init_x_inv_rms():
+        return 0.75 + 0.5 * torch.rand(T, 1)
     def init_qr():
         return torch.rand(T, Q_LORA)
     # weights_proj / inner compressor calibrated to the real DeepSeek-V4-Flash CSA indexer
@@ -673,6 +690,7 @@ def build_tensor_specs(start_pos=None):
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x_inv_rms", [T, 1], torch.float32, init_value=init_x_inv_rms),
         TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),

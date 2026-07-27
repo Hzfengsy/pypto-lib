@@ -71,7 +71,10 @@ assert B <= RMS_PAD_TILE
 
 @pl.jit.inline
 def indexer_compressor(
+    # x carries the caller's RMSNorm elementwise half only (x * gamma); the deferred
+    # per-token inv_rms rides in separately and is folded into the projections below.
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[B * S, 1], pl.FP32],
     kv: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
@@ -145,8 +148,14 @@ def indexer_compressor(
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
                 if state_row_i64 >= 0:
                     state_row = pl.cast(state_row_i64, pl.INDEX)
-                    kv_tile = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                    score_tile = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    # Deferred RMSNorm denominator: both projections are linear in x, so it
+                    # lands as a per-token scalar, ahead of the ape add and the pool (which
+                    # mixes tokens carrying different inv_rms). Applied in this vector-only
+                    # scope rather than the kv_score_proj epilogue: a vector op there turns
+                    # that pure-cube task mixed, adding a cube->UB->GM round-trip.
+                    x_inv_rms_s = pl.read(x_inv_rms, [proj_row, 0])
+                    kv_tile = pl.mul(kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM], x_inv_rms_s)
+                    score_tile = pl.mul(score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM], x_inv_rms_s)
                     ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
                     score_tile = pl.add(score_tile, ape_tile)
                     compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
@@ -308,6 +317,7 @@ def indexer_compressor(
 @pl.jit
 def compressor_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[B * S, 1], pl.FP32],
     kv: pl.Out[pl.Tensor[[B, S, HEAD_DIM], pl.FP32]],
     compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
@@ -333,6 +343,7 @@ def compressor_test(
     rope_interleave(cos, sin, cos_il, sin_signed)
     indexer_compressor(
         x,
+        x_inv_rms,
         kv,
         compress_state,
         compress_state_block_table,
@@ -375,8 +386,11 @@ def golden_compressor(tensors):
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
-    kv = x @ wkv.t()                    # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
-    score = x @ wgate.t()               # [B, S, OUT_DIM]
+    # x omitted the RMSNorm inv_rms; both projections are linear, so it applies
+    # here as a per-token row scale (kernel order: scale after the FP32 matmul).
+    x_inv_rms = tensors["x_inv_rms"].float().reshape(x.shape[0], x.shape[1], 1)
+    kv = (x @ wkv.t()) * x_inv_rms        # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
+    score = (x @ wgate.t()) * x_inv_rms   # [B, S, OUT_DIM]
 
     pooled = torch.zeros(bsz, 1, HEAD_DIM, dtype=torch.float32, device=x.device)
     should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
@@ -513,6 +527,10 @@ def build_tensor_specs(start_pos=None):
 
     def init_x():
         return torch.rand(B, S, D)
+    # x is the caller's (x * gamma) half, already in a normalized regime, so the
+    # deferred denominator sits near 1 -- but off it, so the row scale is exercised.
+    def init_x_inv_rms():
+        return 0.75 + 0.5 * torch.rand(B * S, 1)
     def init_compress_state():
         state = torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         state[:, :, OUT_DIM:] = FP32_NEG_INF
@@ -586,6 +604,7 @@ def build_tensor_specs(start_pos=None):
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x_inv_rms", [B * S, 1], torch.float32, init_value=init_x_inv_rms),
         TensorSpec("kv", [B, S, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
