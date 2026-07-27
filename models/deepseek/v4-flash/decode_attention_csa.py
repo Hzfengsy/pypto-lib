@@ -51,6 +51,7 @@ from hc_pre import hc_pre
 from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
+from rope_interleave import rope_interleave
 from decode_sparse_attn import sparse_attn
 
 # model config
@@ -169,6 +170,14 @@ def attention_csa(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Interleave-duplicated / sign-folded step rope rows for the indexer subsystem.
+    # The indexer's qr_rope re-ran the j>>1 dup-gather on each of its 16 spmd blocks
+    # (32 rows each) and its compressor once more; pl.gather lowers to a per-row
+    # TGATHER loop, so that was ~1056 row-gathers per layer to rebuild one small
+    # position-invariant table. Built once here instead (B rows, off the critical
+    # path -- this scope has no producer) and read as a plain load downstream.
+    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         for b in pl.range(B):
             first_t = b * S
@@ -184,8 +193,13 @@ def attention_csa(
             step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
+    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
+
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Same hoist as step_cos_il above, for the main compressor's rmsnorm_rope.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
         for b in pl.range(B):
             first_t = b * S
@@ -194,6 +208,8 @@ def attention_csa(
             cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
             cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -233,7 +249,7 @@ def attention_csa(
         x_normed, cmp_out,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
+        cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
         late_dep,
     )
@@ -243,7 +259,7 @@ def attention_csa(
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
     indexer(
         x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-        weights_proj, step_cos, step_sin, hadamard_idx,
+        weights_proj, step_cos_il, step_sin_signed, hadamard_idx,
         idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
