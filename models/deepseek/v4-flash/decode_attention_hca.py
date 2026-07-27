@@ -34,6 +34,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
+from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import compressor_ratio128
 from decode_sparse_attn_hca import sparse_attn_hca, CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
@@ -147,6 +148,12 @@ def attention_hca(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    # Interleave-duplicated / sign-folded compressed-position rope rows. The ratio-128
+    # compressor's rmsnorm_rope_cache_write rebuilt this j>>1 dup-gather itself; pl.gather
+    # lowers to a per-row TGATHER loop, so it is hoisted here (once, B rows) and read as a
+    # plain load downstream.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
         for b in pl.range(B):
             first_t = b * S
@@ -164,6 +171,8 @@ def attention_hca(
                 step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
+
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
@@ -199,7 +208,7 @@ def attention_hca(
         x_normed_bsd, cmp_kv_proj,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
+        cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
         late_dep,
     )

@@ -23,6 +23,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from rope_interleave import rope_interleave
 
 
 # model config
@@ -78,8 +79,10 @@ def indexer_compressor(
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
@@ -133,7 +136,7 @@ def indexer_compressor(
     # online-softmax pool that batch's window into pooled_kv. One region -- each batch's pool
     # reads only its own just-scattered state (per-batch block table), so no cross-task barrier.
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool", allow_early_resolve=True):
         for c_idx in pl.range(B):
             for s_sc in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s_sc])
@@ -210,13 +213,15 @@ def indexer_compressor(
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.BF16)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
-        # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
-        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
-        sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad.
+        # cos/sin arrive interleave-duplicated and sign-folded, so these land at the
+        # full ROPE_HEAD_DIM width and feed the rotation with no in-scope dup-gather.
+        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        cos_b[0:B, 0 : ROPE_HEAD_DIM] = cos[0:B, 0 : ROPE_HEAD_DIM]
+        sin_b[0:B, 0 : ROPE_HEAD_DIM] = sin[0:B, 0 : ROPE_HEAD_DIM]
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
-        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+        for k0 in pl.pipeline(0, HEAD_DIM, HEAD_TILE, stage=2):
             kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
@@ -224,7 +229,7 @@ def indexer_compressor(
 
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_PAD_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
-        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
+        for k0 in pl.pipeline(0, NOPE_HEAD_DIM, HEAD_TILE, stage=2):
             kv_norm_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
@@ -239,22 +244,18 @@ def indexer_compressor(
         # A3 interleaved swap-gather (same form as kv_rms_norm_rope in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
         # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
-        # carries gamma[j^1]; inv_rms is per-row so it commutes. swap_idx (j^1), sign
-        # ([-1,+1,...]) and dup_idx (j>>1) are built IN-KERNEL from pl.arange; cos_il/sin_il
-        # are dup-gathered from the per-batch cos/sin rows. normed_kv is BF16 -> cast on write.
-        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
+        # carries gamma[j^1]; inv_rms is per-row so it commutes. Only swap_idx (j^1) is built
+        # in-kernel -- it permutes data, so no table can hold it; the interleaved cos and
+        # sign-folded sin come in ready to use. normed_kv is BF16 -> cast on write.
+        #   out[j] = n[j]*cos_il[j] + n[j^1]*sin_il_signed[j]
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
         rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
         rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
         rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
         rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
         normed_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
             rope_rot,
             target_type=pl.BF16,
@@ -325,6 +326,11 @@ def compressor_test(
 ):
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
+    # The fused path builds these once in csa_rope_step; standalone does the same
+    # prep here so the fixture / golden keep the half-width cos/sin ABI.
+    cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(cos, sin, cos_il, sin_signed)
     indexer_compressor(
         x,
         kv,
@@ -334,8 +340,8 @@ def compressor_test(
         wgate,
         ape,
         norm_w,
-        cos,
-        sin,
+        cos_il,
+        sin_signed,
         hadamard,
         idx_kv_cache,
         idx_kv_scale,
