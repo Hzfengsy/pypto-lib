@@ -204,10 +204,14 @@ def sparse_attn_swa(
         qk_tail = WIN - qk_len
         if qk_tail > 0:
             # Cold start: rows past the visible prefix are allocated but not yet
-            # written. Fill them from a live pool row so no unwritten cache line
-            # reaches the QK matmul; sparse_bias masks their scores regardless.
-            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len, 0], [0, 0],
-                                  [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_tail, HEAD_DIM])
+            # written. Replicate the window's oldest visible slot over them --
+            # that row is written by definition, whereas a run starting anywhere
+            # else in the pool is no more initialized than the rows it replaces.
+            # sparse_bias masks their scores, but a non-finite value would reach
+            # the QK matmul and propagate through row_max before it applied.
+            for qk_fill in pl.range(qk_tail):
+                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
+                                      [qk_src0, 0], [1, HEAD_DIM])
 
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
