@@ -216,7 +216,7 @@ def compressor_ratio4(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for rms_blk in pl.spmd(rms_blocks, name_hint="rmsnorm_rope_cache_write"):
+    for rms_blk in pl.spmd(rms_blocks, name_hint="rmsnorm_rope_cache_write", allow_early_resolve=True):
         # one 16-row block of B; rows rms_blk_rows..15 are pad on the tail block
         b0 = rms_blk * RMS_PAD_TILE
         rms_blk_rows = pl.min(RMS_PAD_TILE, b_dim - b0)

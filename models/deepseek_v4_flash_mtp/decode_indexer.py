@@ -250,7 +250,7 @@ def indexer(
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
         weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :] = weights_acc
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce", allow_early_resolve=True):
         w_sum = weights_partial[0:MM_ROW_TILE, :]
         for kb in pl.unroll(1, WEIGHTS_OK):
             w_sum = pl.add(w_sum, weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :])

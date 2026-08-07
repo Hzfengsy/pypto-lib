@@ -282,7 +282,7 @@ def indexer_compressor(
             kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
             kv_final[had_b0 : had_b0 + RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
-    for wr_blk in pl.spmd(rms_blocks, name_hint="kv_and_cache_write"):
+    for wr_blk in pl.spmd(rms_blocks, name_hint="kv_and_cache_write", allow_early_resolve=True):
         # C8 quant-on-write: per-row INT8 quant of the block (M=RMS_PAD_TILE keeps tiles 32B-aligned;
         # quantize the bf16-rounded value to match golden)
         wr_b0 = wr_blk * RMS_PAD_TILE

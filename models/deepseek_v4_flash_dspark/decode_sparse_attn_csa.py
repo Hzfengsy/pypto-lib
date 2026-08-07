@@ -136,7 +136,7 @@ def sparse_attn_csa(
     # add_inout by itself, so the enclosing layer's in-place KV-cache writeback would
     # lose its WAR edge against the qk_pv gather read. add_inout is a param-level
     # property, so this one no-op tile self-copy suffices.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch", allow_early_resolve=True):
         ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
 
     # qk_plan compacts the T*SPARSE_BLOCKS (token, sparse-block) work items into
@@ -218,7 +218,7 @@ def sparse_attn_csa(
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid]) as _qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as _qk_tid:
         qk_core = pl.tile.get_block_idx()
         # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
         # count is derived from the lane index (no stored per-core count); a lane
@@ -307,7 +307,7 @@ def sparse_attn_csa(
     # j^1 lane-swap index for merge_norm's rotation gather. Shaped [H_TILE, ROPE_DIM]
     # because gather's index must match its source rows.
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
         sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
