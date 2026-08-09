@@ -96,6 +96,13 @@ TOPK = WIN + CMP_TOPK
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 QK_ITEMS = T * SPARSE_BLOCKS   # qk_pv work items: one per (token, sparse block)
+# Page-contiguous runs one sliding-window K tile spans. WIN, not the K tile size,
+# caps how many window rows a tile can hold; BLOCK_SIZE only sets where the cuts
+# fall, being where physical contiguity breaks. So: those rows plus a worst-case
+# BLOCK_SIZE - 1 head offset, rounded up to pages -- 2 whenever WIN <= BLOCK_SIZE,
+# whatever ATTN_K_TILE is, and it grows on its own if either outgrows a page.
+SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
+SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE
 # Token tile for the slot / bias vector work; the whole-T form would put
 # [T, IDX_TOPK] FP32 tiles well past the Vec limit.
 BIAS_T_TILE = min(T, 8)
@@ -236,28 +243,57 @@ def sparse_attn_csa(
             qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
             if qk_block_valid > 0:
                 qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
-                for qk_r in pl.range(ATTN_K_TILE):
-                    qk_k = qk_s0 + qk_r
-                    if qk_k < WIN:
-                        qk_win_slot_i32 = pl.read(window_swa_indices, [qk_t, qk_k])
-                        if qk_win_slot_i32 >= 0:
-                            qk_win_slot = pl.cast(qk_win_slot_i32, pl.INDEX)
-                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_win_slot, 0], [1, HEAD_DIM])
+                # Sliding-window rows of this tile: all ATTN_K_TILE of them at
+                # WIN == ATTN_K_TILE, none for a compressed tile.
+                qk_win_rows = pl.min(pl.max(WIN - qk_s0, 0), ATTN_K_TILE)
+                if qk_win_rows > 0:
+                    # The window is consecutive absolute positions and paged KV keeps one
+                    # page's positions in consecutive rows, so these rows are SWA_RUNS
+                    # page-contiguous runs -- one multi-row gather each (row count carried
+                    # by valid_shape) instead of a single-row DMA per row. Visible length
+                    # and start mirror the metadata producers
+                    # (decode_metadata.build_swa_metadata / utils.swa_indices_and_lens).
+                    qk_pos = pl.cast(pl.read(position_ids, [qk_t, 0]), pl.INDEX)
+                    qk_win_len = pl.min(qk_pos + 1, WIN)
+                    qk_win_start = qk_pos - qk_win_len + 1
+                    qk_run_rows = pl.min(pl.max(qk_win_len - qk_s0, 0), qk_win_rows)
+                    # qk_head is how far into its page this tile's first window row sits,
+                    # so run i holds the rows landing in the i-th page the tile touches:
+                    # [i * BLOCK_SIZE - qk_head, (i + 1) * BLOCK_SIZE - qk_head) clipped to
+                    # [0, qk_run_rows). Run 0 is the short one, every later run is page
+                    # aligned, and runs past the end clip empty -- no carried cursor.
+                    qk_head = (qk_win_start + qk_s0) % BLOCK_SIZE
+                    for qk_run in pl.unroll(SWA_RUNS):
+                        qk_run_lo = pl.max(qk_run * BLOCK_SIZE - qk_head, 0)
+                        qk_run_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_head, qk_run_rows)
+                        if qk_run_hi > qk_run_lo:
+                            qk_run_raw = pl.read(window_swa_indices, [qk_t, qk_s0 + qk_run_lo])
+                            # An unmapped page (-1) falls back to row 0 like the tail below
+                            # -- every such slot is NEG_INF-masked by sparse_bias.
+                            qk_run_src = pl.cast(pl.max(qk_run_raw, 0), pl.INDEX)
+                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_run_lo, 0], [qk_run_src, 0],
+                                                  [ATTN_K_TILE, HEAD_DIM],
+                                                  valid_shape=[qk_run_hi - qk_run_lo, HEAD_DIM])
+                    qk_tail_n = qk_win_rows - qk_run_rows
+                    if qk_tail_n > 0:
+                        # Slots past the visible window still need finite data so their
+                        # NEG_INF-biased lanes exp to ~0 instead of reading stale L1.
+                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_run_rows, 0], [0, 0],
+                                              [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_tail_n, HEAD_DIM])
+                # Compressed rows stay per-row: the indexer top-k slots are scattered.
+                for qk_r in pl.range(qk_win_rows, ATTN_K_TILE):
+                    qk_cmp_k = qk_s0 + qk_r - WIN
+                    if qk_cmp_k < CMP_TOPK:
+                        qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
+                        if qk_ridx >= 0:
+                            qk_slot = qk_ridx
+                            qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
+                            qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
                         else:
                             qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
                     else:
-                        qk_cmp_k = qk_k - WIN
-                        if qk_cmp_k < CMP_TOPK:
-                            qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
-                            if qk_ridx >= 0:
-                                qk_slot = qk_ridx
-                                qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
-                                qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
-                                qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
-                            else:
-                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
-                        else:
-                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
+                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
 
                 # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
                 # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
@@ -671,7 +707,7 @@ def build_tensor_specs(
     """Build deterministic demo tensors for the CSA standalone harness."""
     import torch
     from golden import TensorSpec
-    from utils import block_table, quant_w_per_channel
+    from utils import block_table, quant_w_per_channel, swa_indices_and_lens
     from utils import build_rope_tables, materialize_token_rope_tables
 
     tokens = batch * S
@@ -698,16 +734,21 @@ def build_tensor_specs(
         return kv
 
     def init_window_swa_indices():
-        """Build physical cache-row indices for standalone window raw slots."""
-        tbl = init_window_block_table()
-        indices = torch.full((tokens, WIN), -1, dtype=torch.int32)
-        for t in range(tokens):
-            b = t // S
-            for raw in range(WIN):
-                blk = int(tbl[b, raw // BLOCK_SIZE].item())
-                if blk >= 0:
-                    indices[t, raw] = blk * BLOCK_SIZE + raw % BLOCK_SIZE
-        return indices
+        """Lower the window through the same producer the model uses.
+
+        Indexing the block table by window slot instead of absolute position
+        would keep every row of a WIN == BLOCK_SIZE window inside one page, so
+        the fixture could not tell a correct page-run split from a broken one.
+        Going through swa_indices_and_lens straddles a page boundary whenever
+        init_position_ids is not page-aligned, which it is not.
+        """
+        positions = init_position_ids().reshape(batch, S)
+        return swa_indices_and_lens(
+            positions,
+            init_window_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        )[0].contiguous()
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
