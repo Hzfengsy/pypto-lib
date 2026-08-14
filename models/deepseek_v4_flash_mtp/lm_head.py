@@ -69,14 +69,33 @@ MAX_LOGIT_ROWS = DECODE_TOKENS
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
-# Tiling
+# Tiling. Both matmul tiles clear the 512 B contiguous-transfer floor: the
+# K-contiguous weight slice moves FUSED_K_TILE * 2 B and the FP32 logits store
+# moves FUSED_VOCAB_TILE * 4 B.
 FUSED_K_TILE = 256
-FUSED_VOCAB_TILE = 128
+FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
+# The vocab shard rarely divides the matmul tile. The ragged remainder gets its
+# own narrow matmul (see the tail block below) rather than a padded valid_shape
+# load: the fused push writes an aiv_shard result whole, and there is no legal
+# way to narrow one back to the real extent -- a subview of a shard is rejected,
+# and a padded accumulator does not carry its valid extent across the C->V edge.
+VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
+VOCAB_LAST_TILE = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
+# AIV lanes per AICore. A mode=NONE split region runs its body on both, so the
+# fused kernel shards owners across them to keep every push and notify single.
+AIV_LANES = 2
+# The ragged tail still projects one owner pair at a time: its shard is pushed
+# straight from the vector lane, so it must already be exactly one owner's rows.
+PAIR_ROWS = AIV_LANES * MAX_LOGIT_ROWS
+OWNER_PAIRS = TP_SIZE // AIV_LANES
+# The shard cannot be sliced, so it lands whole in a GM scratch and the per-owner
+# pushes slice that scratch instead -- a plain tensor slice, which is legal.
+SHARD_ROWS = GROUP_LOGIT_ROWS // AIV_LANES
+OWNERS_PER_LANE = TP_SIZE // AIV_LANES
 DONE_VALUE = 1
 
 # Greedy sampling uses exact 256-token chunks so the real vocabulary has no
@@ -96,6 +115,15 @@ LOGITS_COMM_BLOCKS = min(
 )
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 
+assert TP_SIZE % AIV_LANES == 0, "owners must divide evenly across the AIV lanes"
+# What keeps the GM staging race-free: an UP_DOWN lane writes exactly the row
+# band it later reads, and the two lanes' bands are disjoint, so no GM address is
+# touched by both lanes and the store->push RAW stays inside one lane. That holds
+# only while a lane's row half equals the rows of the owners it serves -- assert
+# it rather than rely on the coincidence.
+assert SHARD_ROWS == OWNERS_PER_LANE * MAX_LOGIT_ROWS, (
+    "each AIV lane's shard rows must be exactly the rows of the owners it pushes"
+)
 assert D % FUSED_K_TILE == 0
 assert D % HIDDEN_GATHER_TILE == 0
 assert VOCAB % TP_SIZE == 0
@@ -187,95 +215,132 @@ def lm_head(
         gk0 = gkb * HIDDEN_GATHER_TILE
         owner_hiddens[:, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[:, gk0 : gk0 + HIDDEN_GATHER_TILE]
 
+    # Mixed cube + comm kernel: the cube projects a vocab tile, pl.aiv_shard
+    # carries that accumulator across the C->V edge, and pld.tensor.remote_store
+    # pushes each owner's rows to that peer's window from the vector lane. Each
+    # tile therefore goes on the wire while the cube projects the next one,
+    # instead of the whole shard waiting for the last matmul -- that overlap is
+    # the point of fusing the projection and the push into one scope.
+    # The ragged last tile gets its own narrow matmul below rather than a padded
+    # load: its accumulator is already VOCAB_LAST_TILE wide, so the push stays a
+    # whole-shard write.
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
-    # Project all group-owner rows in one matmul M tile.
-    for lm_core in pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul"):
-        for mm_ob in pl.range(lm_core, VOCAB_PER_TP // FUSED_VOCAB_TILE, FUSED_LM_HEAD_CORES):
+    with pl.spmd(
+        FUSED_LM_HEAD_CORES,
+        name_hint="lm_head_matmul_push",
+        optimizations=[pl.cross_core_slot(slot_num=2)],
+    ) as _push_tid:
+        lm_core = pl.tile.get_block_idx()
+        vocab_base = tp_rank * VOCAB_PER_TP
+        for mm_ob in pl.range(lm_core, VOCAB_FULL_TILES, FUSED_LM_HEAD_CORES):
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
+            # M is the full group extent again -- one matmul per vocab tile.
             mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
             mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
             mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
             for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
                 mm_k0 = mm_kb * FUSED_K_TILE
                 mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
+                mm_weight_tile = lm_head_weight[
+                    mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE
+                ]
                 mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
-            logits_shards[:, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
 
-        if VOCAB_TAIL != 0:
-            if lm_core == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
-                mm_tail_o0 = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                mm_hidden_t0 = owner_hiddens[:, 0:FUSED_K_TILE]
-                mm_weight_t0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
-                mm_acc_tail = pl.matmul(mm_hidden_t0, mm_weight_t0, b_trans=True, out_dtype=pl.FP32)
-                for mm_tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                    mm_tail_k0 = mm_tail_kb * FUSED_K_TILE
-                    mm_hidden_tk = owner_hiddens[:, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
-                    mm_weight_tk = lm_head_weight[
-                        mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
-                    ]
-                    mm_acc_tail = pl.matmul_acc(mm_acc_tail, mm_hidden_tk, mm_weight_tk, b_trans=True)
-                logits_shards[:, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = mm_acc_tail
-
-    # Send each owner its slice of this card's vocab shard, split over vocab comm
-    # tiles: block blk pushes its tiles to every owner.
-    for blk in pl.spmd(LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_push"):
-        vocab_base = tp_rank * VOCAB_PER_TP
-        for owner_tp in pl.range(TP_SIZE):
-            source_row_base = owner_tp * MAX_LOGIT_ROWS
-
-            # put, not tile.remote_store: remote_store does not drain before the
-            # notify issues (PTOAS#872), so the peer's gather reads tiles still in
-            # flight. Self-target rides the same put -- a local pl.store makes a new
-            # SSA version of logits_window that the gather cannot read across scopes
-            # without a comm ctx.
-            for ob in pl.range(blk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
-                o0 = ob * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=logits_shards,
-                    dst_offsets=[0, vocab_base + o0],
-                    src_offsets=[source_row_base, o0],
-                    shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
-                )
-
-            if LOGITS_COMM_TAIL != 0:
-                if blk == LOGITS_TAIL_BLOCK:
-                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
-                    pld.tensor.put(
-                        dst=logits_window,
-                        peer=group_base + owner_tp,
-                        src=logits_shards,
-                        dst_offsets=[0, vocab_base + tail_o0],
-                        src_offsets=[source_row_base, tail_o0],
-                        shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
+            # WORKAROUND -- revert once a subview of a pl.aiv_shard result is
+            # legal (filed against ptoas). The shard cannot be sliced, so it is
+            # stored whole to GM and the per-owner pushes read slices back out.
+            # That costs an extra GM write and an extra GM read of every tile,
+            # traffic a direct shard-to-peer push would not pay at all. It is
+            # still the cheaper option: pinning the matmul M extent to one owner
+            # per lane instead -- the only slice-free alternative -- triples cube
+            # time at tp=8 and turns the fusion into a regression there.
+            #
+            # Race-free by construction: UP_DOWN gives each lane a disjoint row
+            # band that it both writes and reads, so no GM address is touched by
+            # both lanes. The SHARD_ROWS assert above is what keeps that true.
+            for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                mm_shard = pl.aiv_shard(mm_acc)
+                lane_r0 = aiv_id * SHARD_ROWS
+                logits_shards[
+                    lane_r0 : lane_r0 + SHARD_ROWS, mm_o0 : mm_o0 + FUSED_VOCAB_TILE
+                ] = mm_shard
+                for owner_slot in pl.range(OWNERS_PER_LANE):
+                    owner_tp = aiv_id * OWNERS_PER_LANE + owner_slot
+                    src_r0 = owner_tp * MAX_LOGIT_ROWS
+                    pld.tensor.remote_store(
+                        logits_shards[
+                            src_r0 : src_r0 + MAX_LOGIT_ROWS,
+                            mm_o0 : mm_o0 + FUSED_VOCAB_TILE,
+                        ],
+                        logits_window,
+                        group_base + owner_tp,
+                        [0, vocab_base + mm_o0],
                     )
 
-        # Notify folded into the push: each block signals every peer after its own
-        # stores, so a peer sees LOGITS_COMM_BLOCKS notifies per source per epoch.
-        for owner_tp in pl.range(TP_SIZE):
-            if owner_tp != tp_rank:
-                pld.system.notify(
-                    target=logits_done,
-                    peer=group_base + owner_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+        # Ragged tail: its own matmul on one block, with the accumulator already
+        # VOCAB_LAST_TILE wide. Hoisted out of the strided loop rather than
+        # branched inside it -- a dynamic branch would give the accumulator two
+        # static shapes, which MemoryReuse cannot reconcile across the C->V edge.
+        if VOCAB_LAST_TILE != 0:
+            if lm_core == VOCAB_FULL_TILES % FUSED_LM_HEAD_CORES:
+                mm_tail_o0 = VOCAB_FULL_TILES * FUSED_VOCAB_TILE
+                for tail_pair in pl.range(OWNER_PAIRS):
+                    tail_r0 = tail_pair * PAIR_ROWS
+                    tail_hidden0 = owner_hiddens[tail_r0 : tail_r0 + PAIR_ROWS, 0:FUSED_K_TILE]
+                    tail_weight0 = lm_head_weight[
+                        mm_tail_o0 : mm_tail_o0 + VOCAB_LAST_TILE, 0:FUSED_K_TILE
+                    ]
+                    tail_acc = pl.matmul(
+                        tail_hidden0, tail_weight0, b_trans=True, out_dtype=pl.FP32
+                    )
+                    for tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                        tail_k0 = tail_kb * FUSED_K_TILE
+                        tail_hidden_tile = owner_hiddens[
+                            tail_r0 : tail_r0 + PAIR_ROWS, tail_k0 : tail_k0 + FUSED_K_TILE
+                        ]
+                        tail_weight_tile = lm_head_weight[
+                            mm_tail_o0 : mm_tail_o0 + VOCAB_LAST_TILE,
+                            tail_k0 : tail_k0 + FUSED_K_TILE,
+                        ]
+                        tail_acc = pl.matmul_acc(
+                            tail_acc, tail_hidden_tile, tail_weight_tile, b_trans=True
+                        )
 
-    # Wait only (the notify rides inside the push). The logits_shards read is an
-    # anchor, not data: it deps this task on lm_head_matmul so the wait runs
-    # alongside our own push. An unanchored wait dispatches immediately and spins
-    # holding a core group.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait") as _cwait_tid:
-        _shard_anchor = pl.read(logits_shards, [0, 0])
+                    for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                        tail_shard = pl.aiv_shard(tail_acc)
+                        pld.tensor.remote_store(
+                            tail_shard,
+                            logits_window,
+                            group_base + tail_pair * AIV_LANES + aiv_id,
+                            [0, vocab_base + mm_tail_o0],
+                        )
+
+        # Notify folded into the push: each block signals every peer after its own
+        # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.
+        for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
+            for notify_pair in pl.range(OWNER_PAIRS):
+                owner_tp = notify_pair * AIV_LANES + aiv_id
+                if owner_tp != tp_rank:
+                    pld.system.notify(
+                        target=logits_done,
+                        peer=group_base + owner_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+
+    # Wait only (the notify rides inside the push). deps on the push scope so the
+    # wait runs alongside our own push; an unanchored wait dispatches immediately
+    # and spins holding a core group.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid]
+    ) as _cwait_tid:
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
                 pld.system.wait(
                     signal=logits_done,
                     offsets=[src_tp, 0],
-                    expected=pl.cast(done_epoch * LOGITS_COMM_BLOCKS, pl.INT32),
+                    expected=pl.cast(done_epoch * FUSED_LM_HEAD_CORES, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
