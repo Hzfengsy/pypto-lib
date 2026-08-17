@@ -77,21 +77,22 @@ FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 256
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-# The vocab shard rarely divides the matmul tile. The ragged remainder gets its
-# own narrow matmul (see the tail block below) rather than a padded valid_shape
-# load: the fused push writes an aiv_shard result whole, and there is no legal
-# way to narrow one back to the real extent -- a subview of a shard is rejected,
-# and a padded accumulator does not carry its valid extent across the C->V edge.
+# The vocab shard rarely divides the matmul tile, so the last tile is ragged. It
+# rides the same loop as every other tile rather than getting a tail case: the
+# weight load carries a valid_shape, which is what keeps the load inside
+# lm_head_weight, and the tile count is a plain ceil. The narrow extent is then
+# dropped at the crossing and re-applied at the push -- see the two comments in
+# the fused scope. logits_shards is padded to whole tiles so the last tile's
+# full-width store stays in bounds.
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 VOCAB_LAST_TILE = VOCAB_PER_TP % FUSED_VOCAB_TILE
+VOCAB_TILES = VOCAB_FULL_TILES + (1 if VOCAB_LAST_TILE != 0 else 0)
+SHARDS_VOCAB = VOCAB_TILES * FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
 # AIV lanes per AICore. A mode=NONE split region runs its body on both, so the
 # fused kernel shards owners across them to keep every push and notify single.
 AIV_LANES = 2
-# The ragged tail still projects one owner pair at a time: its shard is pushed
-# straight from the vector lane, so it must already be exactly one owner's rows.
-PAIR_ROWS = AIV_LANES * MAX_LOGIT_ROWS
 OWNER_PAIRS = TP_SIZE // AIV_LANES
 # The shard cannot be sliced, so it lands whole in a GM scratch and the per-owner
 # pushes slice that scratch instead -- a plain tensor slice, which is legal.
@@ -221,10 +222,10 @@ def lm_head(
     # tile therefore goes on the wire while the cube projects the next one,
     # instead of the whole shard waiting for the last matmul -- that overlap is
     # the point of fusing the projection and the push into one scope.
-    # The ragged last tile gets its own narrow matmul below rather than a padded
-    # load: its accumulator is already VOCAB_LAST_TILE wide, so the push stays a
-    # whole-shard write.
-    logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
+    # The ragged last tile is just a padded tile in the same loop: its weight load
+    # carries valid_shape, its padded columns ride to GM as don't-care, and the
+    # push is narrowed back to the real width.
+    logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, SHARDS_VOCAB], dtype=pl.FP32)
     with pl.spmd(
         FUSED_LM_HEAD_CORES,
         name_hint="lm_head_matmul_push",
@@ -232,19 +233,39 @@ def lm_head(
     ) as _push_tid:
         lm_core = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
-        for mm_ob in pl.range(lm_core, VOCAB_FULL_TILES, FUSED_LM_HEAD_CORES):
+        for mm_ob in pl.range(lm_core, VOCAB_TILES, FUSED_LM_HEAD_CORES):
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
-            # M is the full group extent again -- one matmul per vocab tile.
+            # Real width of this tile: the full tile everywhere except the ragged
+            # last one, where the weight rows run out early. The box stays static
+            # so the accumulator keeps one shape for every iteration.
+            mm_valid_n = pl.min(VOCAB_PER_TP - mm_o0, FUSED_VOCAB_TILE)
+            # M is the full group extent -- one matmul per vocab tile.
             mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
-            mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
+            mm_weight0 = pl.slice(
+                lm_head_weight,
+                [FUSED_VOCAB_TILE, FUSED_K_TILE],
+                [mm_o0, 0],
+                valid_shape=[mm_valid_n, FUSED_K_TILE],
+            )
             mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
             for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
                 mm_k0 = mm_kb * FUSED_K_TILE
                 mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_weight_tile = lm_head_weight[
-                    mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE
-                ]
+                mm_weight_tile = pl.slice(
+                    lm_head_weight,
+                    [FUSED_VOCAB_TILE, FUSED_K_TILE],
+                    [mm_o0, mm_k0],
+                    valid_shape=[mm_valid_n, FUSED_K_TILE],
+                )
                 mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
+
+            # Declare the columns fully valid before the C->V crossing. The
+            # boundary transports the full box and can only rebuild a narrowed
+            # column extent with the compile-time-static pto.treshape, so a
+            # runtime-valued one is rejected outright. The padded columns of the
+            # ragged tile are don't-care here: they ride to GM and the push below
+            # is what cuts them off, so they never reach a peer's window.
+            mm_acc = pl.set_validshape(mm_acc, GROUP_LOGIT_ROWS, FUSED_VOCAB_TILE)
 
             # WORKAROUND -- revert once a subview of a pl.aiv_shard result is
             # legal (filed against ptoas). The shard cannot be sliced, so it is
@@ -267,53 +288,26 @@ def lm_head(
                 for owner_slot in pl.range(OWNERS_PER_LANE):
                     owner_tp = aiv_id * OWNERS_PER_LANE + owner_slot
                     src_r0 = owner_tp * MAX_LOGIT_ROWS
+                    # valid_shape rather than a narrower box: the box has to stay
+                    # static for the tile type, and a full-width push of the ragged
+                    # tile would run past this rank's slice of the shared window
+                    # into the next rank's. pl.min is inlined instead of reusing
+                    # mm_valid_n because a named cube-side scalar cannot be
+                    # materialized inside the AIV function.
                     pld.tensor.remote_store(
-                        logits_shards[
-                            src_r0 : src_r0 + MAX_LOGIT_ROWS,
-                            mm_o0 : mm_o0 + FUSED_VOCAB_TILE,
-                        ],
+                        pl.slice(
+                            logits_shards,
+                            [MAX_LOGIT_ROWS, FUSED_VOCAB_TILE],
+                            [src_r0, mm_o0],
+                            valid_shape=[
+                                MAX_LOGIT_ROWS,
+                                pl.min(VOCAB_PER_TP - mm_o0, FUSED_VOCAB_TILE),
+                            ],
+                        ),
                         logits_window,
                         group_base + owner_tp,
                         [0, vocab_base + mm_o0],
                     )
-
-        # Ragged tail: its own matmul on one block, with the accumulator already
-        # VOCAB_LAST_TILE wide. Hoisted out of the strided loop rather than
-        # branched inside it -- a dynamic branch would give the accumulator two
-        # static shapes, which MemoryReuse cannot reconcile across the C->V edge.
-        if VOCAB_LAST_TILE != 0:
-            if lm_core == VOCAB_FULL_TILES % FUSED_LM_HEAD_CORES:
-                mm_tail_o0 = VOCAB_FULL_TILES * FUSED_VOCAB_TILE
-                for tail_pair in pl.range(OWNER_PAIRS):
-                    tail_r0 = tail_pair * PAIR_ROWS
-                    tail_hidden0 = owner_hiddens[tail_r0 : tail_r0 + PAIR_ROWS, 0:FUSED_K_TILE]
-                    tail_weight0 = lm_head_weight[
-                        mm_tail_o0 : mm_tail_o0 + VOCAB_LAST_TILE, 0:FUSED_K_TILE
-                    ]
-                    tail_acc = pl.matmul(
-                        tail_hidden0, tail_weight0, b_trans=True, out_dtype=pl.FP32
-                    )
-                    for tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                        tail_k0 = tail_kb * FUSED_K_TILE
-                        tail_hidden_tile = owner_hiddens[
-                            tail_r0 : tail_r0 + PAIR_ROWS, tail_k0 : tail_k0 + FUSED_K_TILE
-                        ]
-                        tail_weight_tile = lm_head_weight[
-                            mm_tail_o0 : mm_tail_o0 + VOCAB_LAST_TILE,
-                            tail_k0 : tail_k0 + FUSED_K_TILE,
-                        ]
-                        tail_acc = pl.matmul_acc(
-                            tail_acc, tail_hidden_tile, tail_weight_tile, b_trans=True
-                        )
-
-                    for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                        tail_shard = pl.aiv_shard(tail_acc)
-                        pld.tensor.remote_store(
-                            tail_shard,
-                            logits_window,
-                            group_base + tail_pair * AIV_LANES + aiv_id,
-                            [0, vocab_base + mm_tail_o0],
-                        )
 
         # Notify folded into the push: each block signals every peer after its own
         # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.
