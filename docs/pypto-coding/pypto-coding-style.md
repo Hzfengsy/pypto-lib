@@ -327,23 +327,38 @@ out = pl.matmul(tile_a, tile_b)
 out = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32, b_trans=True)
 ```
 
-### `pl.matmul_acc(acc, lhs, rhs, *, a_trans=False, b_trans=False)`
+### `pl.matmul_acc(acc, lhs, rhs, *, a_trans=False, b_trans=False, init_cond=None)`
 
 Fused multiply-accumulate: `acc += lhs @ rhs`. Use this inside a K-loop to
-keep the partial sum on chip. The first iteration uses `pl.matmul`,
-subsequent iterations use `pl.matmul_acc` — the accumulator is the value
-`pl.matmul` returned, so nothing is allocated for it:
+keep the partial sum on chip. `init_cond` overwrites `acc` with `lhs @ rhs`
+on the steps where the predicate holds instead of accumulating into it, so
+one call covers the whole K-loop — the accumulator is never zeroed and the
+first K step is not peeled:
 
 ```python
 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kproj"):
+    acc = pl.create_tensor([M, N], dtype=pl.FP32)
     for kb in pl.pipeline(0, K // K_STEP, stage=2):
         k0 = kb * K_STEP
         tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
         tile_b = pl.slice(b, [K_STEP, N], [k0, n0])
-        if kb == 0:
-            acc = pl.matmul(tile_a, tile_b)
-        else:
-            acc = pl.matmul_acc(acc, tile_a, tile_b)
+        acc = pl.matmul_acc(acc, tile_a, tile_b, init_cond=(kb == 0))
+```
+
+`init_cond` is 2D-only. An operand of rank greater than 2 — a grouped GEMM
+that keeps its group axis, say — is rejected, and the K-loop peels its first
+step instead: `pl.matmul` on `kb == 0`, `pl.matmul_acc` after.
+
+```python
+acc = pl.create_tensor([1, M, N], dtype=pl.INT32)
+for kb in pl.pipeline(0, K // K_STEP, stage=2):
+    k0 = kb * K_STEP
+    tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
+    tile_b = w[g : g + 1, n0 : n0 + N, k0 : k0 + K_STEP]
+    if kb == 0:
+        acc = pl.matmul(tile_a, tile_b, b_trans=True, out_dtype=pl.INT32)
+    else:
+        acc = pl.matmul_acc(acc, tile_a, tile_b, b_trans=True)
 ```
 
 ### `pl.matmul_bias(lhs, rhs, bias)`
@@ -641,14 +656,12 @@ projection with cast/residual epilogue:
 q_proj = pl.create_tensor([BATCH, Q_HIDDEN], dtype=pl.BF16)
 for q0 in pl.parallel(0, Q_HIDDEN, Q_OUT_STEP):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+        q_acc = pl.create_tensor([BATCH, Q_OUT_STEP], dtype=pl.FP32)
         for kb in pl.pipeline(0, HIDDEN // K_STEP, stage=2):
             k0 = kb * K_STEP
             tile_a = pl.slice(normed, [BATCH, K_STEP], [0, k0])    # vec src
             tile_b = pl.slice(wq, [K_STEP, Q_OUT_STEP], [k0, q0])  # cube right
-            if kb == 0:
-                q_acc = pl.matmul(tile_a, tile_b)              # cube
-            else:
-                q_acc = pl.matmul_acc(q_acc, tile_a, tile_b)   # cube
+            q_acc = pl.matmul_acc(q_acc, tile_a, tile_b, init_cond=(kb == 0))  # cube
         q_bf16 = pl.cast(q_acc, target_type=pl.BF16)           # vector
         q_proj = pl.assemble(q_proj, q_bf16, [0, q0])          # mte
 ```
