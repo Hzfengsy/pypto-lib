@@ -345,9 +345,9 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="kproj"):
         acc = pl.matmul_acc(acc, tile_a, tile_b, init_cond=(kb == 0))
 ```
 
-`init_cond` is 2D-only. An operand of rank greater than 2 — a grouped GEMM
-that keeps its group axis, say — is rejected, and the K-loop peels its first
-step instead: `pl.matmul` on `kb == 0`, `pl.matmul_acc` after.
+The predicate covers every operand shape `matmul_acc` accumulates, grouped
+GEMMs included — a rank-3 weight slice that keeps its group axis takes
+`init_cond` the same way:
 
 ```python
 acc = pl.create_tensor([1, M, N], dtype=pl.INT32)
@@ -355,10 +355,7 @@ for kb in pl.pipeline(0, K // K_STEP, stage=2):
     k0 = kb * K_STEP
     tile_a = pl.slice(a, [M, K_STEP], [m0, k0])
     tile_b = w[g : g + 1, n0 : n0 + N, k0 : k0 + K_STEP]
-    if kb == 0:
-        acc = pl.matmul(tile_a, tile_b, b_trans=True, out_dtype=pl.INT32)
-    else:
-        acc = pl.matmul_acc(acc, tile_a, tile_b, b_trans=True)
+    acc = pl.matmul_acc(acc, tile_a, tile_b, b_trans=True, init_cond=(kb == 0))
 ```
 
 ### `pl.matmul_bias(lhs, rhs, bias)`
